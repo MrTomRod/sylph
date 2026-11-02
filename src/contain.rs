@@ -7,6 +7,7 @@ use fxhash::FxHashMap;
 use crate::constants::*;
 use crate::inference::*;
 use crate::sketch::*;
+use crate::sketchers::SketchError;
 use crate::twostage_db::TwoStageDb;
 use crate::types::*;
 use log::*;

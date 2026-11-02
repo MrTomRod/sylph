@@ -6,18 +6,36 @@
 //! everything that needs needletail/clap/rayon/filesystem access is behind the
 //! `cli` feature. The actual sketching logic lives in [`crate::sketchers`].
 
-// The pure kernels live in the dependency-light `crate::kernels` module;
-// re-export them here so that `sylph::sketch::{extract_markers, pair_kmer,
-// dup_removal_lsh_full, ...}` keeps working for existing users.
+// The pure kernels live in the private `crate::kernels` module; re-export them
+// here so that `sylph::sketch::{pair_kmer, dup_removal_lsh_full, ...}` keeps
+// working for existing users.
 pub use crate::kernels::{dup_removal_lsh_full_exact, pair_kmer, pair_kmer_single, Marker};
 #[cfg(feature = "approx-dedup")]
 pub use crate::kernels::dup_removal_lsh_full;
-pub use crate::seeding::{extract_markers, extract_markers_positions, Seeding};
-pub use crate::sketchers::{GenomeSketcher, PairedReadSketcher, ReadSketcher, SketchError};
+
+/// Appends the hashed canonical k-mers of `string` to `kmer_vec` using this
+/// build's native seeding kernel (AVX2 on x86_64 when available, scalar
+/// otherwise).
+pub fn extract_markers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+    crate::seeding::extract_markers(string, kmer_vec, c, k);
+}
+
+/// Appends `(contig_number, k-mer end position, hash)` markers using this
+/// build's native seeding kernel.
+pub fn extract_markers_positions(
+    string: &[u8],
+    kmer_vec: &mut Vec<(usize, usize, u64)>,
+    c: usize,
+    k: usize,
+    contig_number: usize,
+) {
+    crate::seeding::extract_markers_positions(string, kmer_vec, c, k, contig_number);
+}
 
 #[cfg(feature = "cli")]
 mod cli {
-    use super::{GenomeSketcher, PairedReadSketcher, ReadSketcher, Seeding, SketchError};
+    use crate::seeding::Seeding;
+    use crate::sketchers::{GenomeSketcher, PairedReadSketcher, ReadSketcher, SketchError};
     use crate::cmdline::*;
     use crate::constants::*;
     use crate::types::*;

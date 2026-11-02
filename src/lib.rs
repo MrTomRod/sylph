@@ -2,13 +2,15 @@
 //!
 //! The library core (this crate compiled with `--no-default-features`) is
 //! dependency-light and builds for `wasm32-unknown-unknown`: it provides the
-//! sketch types ([`types`]), the seeding kernels ([`seeding`]), the pure
-//! read-dedup/pair kernels ([`kernels`]) and push-style sketchers
-//! ([`sketchers`]). The `cli` feature (on by default) adds the command-line
-//! front end and all filesystem/threading/profiling code.
+//! sketch types ([`types`]), the seeding kernels ([`seeding`]) and push-style
+//! sketchers ([`sketchers`]). The `cli` feature (on by default) adds the
+//! command-line front end and all filesystem/threading/profiling code.
+//!
+//! The pure read-dedup/pair kernels are private; they are reachable through
+//! their historical [`sketch`] paths (`sketch::pair_kmer`, ...).
 
 pub mod constants;
-pub mod kernels;
+mod kernels;
 pub mod seeding;
 pub mod sketchers;
 pub mod sketch;

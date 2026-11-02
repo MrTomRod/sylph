@@ -208,8 +208,9 @@ pub fn fmh_seeds_positions(
     }
 }
 
-/// Which seeding kernel [`extract_markers`] / [`extract_markers_positions`]
-/// should use.
+/// Which seeding kernel `extract_markers` / `extract_markers_positions`
+/// (thin wrappers over `extract_markers_with`, re-exported from
+/// [`crate::sketch`]) should use.
 ///
 /// Both kernels require `c > 0` (the k-mer downsampling threshold is
 /// `u64::MAX / c`) and only support `k` up to 32 on the scalar path. In
@@ -234,8 +235,8 @@ pub enum Seeding {
     ///
     /// It produces exactly the k-mers the AVX2 kernel produces, in exactly the
     /// same order, on every architecture (so browser/wasm and aarch64 builds
-    /// can reproduce x86_64 sketches). See [`fmh_seeds_avx2_compat`] and
-    /// [`fmh_seeds_avx2_compat_positions`].
+    /// can reproduce x86_64 sketches). See `fmh_seeds_avx2_compat` and
+    /// `fmh_seeds_avx2_compat_positions`.
     ///
     /// Only `k = 21` and `k = 31` are guaranteed to match the AVX2 kernel
     /// (the AVX2 kernel accepts no other value; the scalar kernel itself
@@ -244,7 +245,7 @@ pub enum Seeding {
 }
 
 /// As [`extract_markers`], with an explicit seeding strategy.
-pub fn extract_markers_with(
+pub(crate) fn extract_markers_with(
     seeding: Seeding,
     string: &[u8],
     kmer_vec: &mut Vec<u64>,
@@ -272,12 +273,12 @@ pub fn extract_markers_with(
 /// Appends the hashed canonical k-mers of `string` to `kmer_vec` using this
 /// build's native seeding kernel (AVX2 on x86_64 when available, scalar
 /// otherwise).
-pub fn extract_markers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+pub(crate) fn extract_markers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
     extract_markers_with(Seeding::Native, string, kmer_vec, c, k);
 }
 
 /// As [`extract_markers_positions`], with an explicit seeding strategy.
-pub fn extract_markers_positions_with(
+pub(crate) fn extract_markers_positions_with(
     seeding: Seeding,
     string: &[u8],
     kmer_vec: &mut Vec<(usize, usize, u64)>,
@@ -307,7 +308,7 @@ pub fn extract_markers_positions_with(
 
 /// Appends `(contig_number, k-mer end position, hash)` markers using this
 /// build's native seeding kernel.
-pub fn extract_markers_positions(
+pub(crate) fn extract_markers_positions(
     string: &[u8],
     kmer_vec: &mut Vec<(usize, usize, u64)>,
     c: usize,
@@ -338,7 +339,7 @@ pub fn extract_markers_positions(
 /// silently empty rather than a panic. For other `k` values this function
 /// still runs, but its output is not a compatibility guarantee for any real
 /// sylph build.
-pub fn fmh_seeds_avx2_compat(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+fn fmh_seeds_avx2_compat(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
     if string.len() < k + 1 {
         return;
     }
@@ -380,7 +381,7 @@ pub fn fmh_seeds_avx2_compat(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k
 /// positions kernel's additional rule: a read shorter than `2 * k` yields
 /// nothing at all. Positions are the k-mer end offsets (`segment start + i`),
 /// as in the AVX2 kernel.
-pub fn fmh_seeds_avx2_compat_positions(
+fn fmh_seeds_avx2_compat_positions(
     string: &[u8],
     kmer_vec: &mut Vec<(usize, usize, u64)>,
     c: usize,

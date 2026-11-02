@@ -156,15 +156,18 @@ impl ReadSketcher {
         &self.kmer_counts
     }
 
-    pub fn num_reads(&self) -> u64 {
+    #[cfg(test)]
+    fn num_reads(&self) -> u64 {
         self.num_reads
     }
 
-    pub fn num_dup_removed(&self) -> usize {
+    #[cfg(test)]
+    fn num_dup_removed(&self) -> usize {
         self.num_dup_removed
     }
 
-    pub fn mean_read_length(&self) -> f64 {
+    #[cfg(test)]
+    fn mean_read_length(&self) -> f64 {
         self.mean_read_length
     }
 
@@ -339,14 +342,6 @@ impl PairedReadSketcher {
         &self.kmer_counts
     }
 
-    pub fn num_read_pairs(&self) -> u64 {
-        self.num_read_pairs
-    }
-
-    pub fn num_dup_removed(&self) -> usize {
-        self.num_dup_removed
-    }
-
     /// Consumes the sketcher and returns the paired sample sketch.
     pub fn finish(self, file_name: String, sample_name: Option<String>) -> SequencesSketch {
         let percent = (self.num_dup_removed as f64)
@@ -435,14 +430,6 @@ impl GenomeSketcher {
             self.contig_number,
         );
         self.contig_number += 1;
-    }
-
-    pub fn num_contigs(&self) -> usize {
-        self.contig_number
-    }
-
-    pub fn genome_size(&self) -> usize {
-        self.gn_size
     }
 
     /// Consumes the sketcher and returns the genome sketch.

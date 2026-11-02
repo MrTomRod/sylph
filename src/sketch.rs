@@ -1,9 +1,5 @@
 use crate::cmdline::*;
-use rand::{rngs::SmallRng, SeedableRng};
-use scalable_cuckoo_filter::ScalableCuckooFilterBuilder;
 
-use fxhash::FxHashSet;
-use fxhash::FxHasher;
 use memory_stats::memory_stats;
 use std::fs;
 use std::thread;
@@ -14,7 +10,6 @@ use crate::types::*;
 use log::*;
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::io::{prelude::*, BufReader};
@@ -27,7 +22,8 @@ use std::sync::Mutex;
 pub use crate::kernels::{
     dup_removal_lsh_full, dup_removal_lsh_full_exact, pair_kmer, pair_kmer_single, Marker,
 };
-pub use crate::seeding::{extract_markers, extract_markers_positions};
+pub use crate::seeding::{extract_markers, extract_markers_positions, Seeding};
+pub use crate::sketchers::{GenomeSketcher, PairedReadSketcher, ReadSketcher, SketchError};
 
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
     if let Some(usage) = memory_stats() {
@@ -303,7 +299,7 @@ pub fn sketch(args: SketchArgs) {
                     &pipeline_params,
                 )
             } else {
-                sketch_pair_sequences(
+                match sketch_pair_sequences(
                     read_file1,
                     read_file2,
                     args.c,
@@ -311,7 +307,13 @@ pub fn sketch(args: SketchArgs) {
                     sample_name.clone(),
                     args.no_dedup,
                     args.fpr,
-                )
+                ) {
+                    Ok(sketch) => Some(sketch),
+                    // The library already logged the problem; keep the CLI's
+                    // historical hard failure for unreadable files.
+                    Err(SketchError::Input(_)) => std::process::exit(1),
+                    Err(_) => None,
+                }
             };
             if read_sketch_opt.is_some() {
                 let res = fs::create_dir_all(&args.sample_output_dir);
@@ -489,63 +491,22 @@ pub fn sketch_genome_individual(
     if !reader.is_ok() {
         warn!("{} is not a valid fasta/fastq file; skipping.", ref_file);
         return vec![];
-    } else {
-        let mut reader = reader.unwrap();
-        let mut return_vec = vec![];
-        while let Some(record) = reader.next() {
-            let mut return_genome_sketch = GenomeSketch::default();
-            return_genome_sketch.c = c;
-            return_genome_sketch.k = k;
-            return_genome_sketch.file_name = ref_file.to_string();
-            if record.is_ok() {
-                let mut pseudotax_track_kmers = vec![];
-                let mut kmer_vec = vec![];
-                let record = record.expect(&format!("Invalid record for file {} ", ref_file));
-                let contig_name = String::from_utf8_lossy(record.id()).to_string();
-                let contig_name_notab = contig_name.replace('\t', " ");
-                return_genome_sketch.first_contig_name = contig_name_notab.to_owned();
-                let seq = record.seq();
-
-                extract_markers_positions(&seq, &mut kmer_vec, c, k, 0);
-
-                let mut kmer_set = MMHashSet::default();
-                let mut duplicate_set = MMHashSet::default();
-                let mut new_vec = Vec::with_capacity(kmer_vec.len());
-                kmer_vec.sort();
-                for (_, _pos, km) in kmer_vec.iter() {
-                    if !kmer_set.contains(&km) {
-                        kmer_set.insert(km);
-                    } else {
-                        duplicate_set.insert(km);
-                    }
-                }
-                let mut last_pos = 0;
-                for (_, pos, km) in kmer_vec.iter() {
-                    if !duplicate_set.contains(&km) {
-                        if last_pos == 0 || pos - last_pos > min_spacing {
-                            new_vec.push(*km);
-                            last_pos = *pos;
-                        } else if pseudotax {
-                            pseudotax_track_kmers.push(*km);
-                        }
-                    }
-                }
-
-                return_genome_sketch.gn_size = record.seq().len();
-                return_genome_sketch.genome_kmers = new_vec;
-                return_genome_sketch.min_spacing = min_spacing;
-                if pseudotax {
-                    return_genome_sketch.pseudotax_tracked_nonused_kmers =
-                        Some(pseudotax_track_kmers);
-                }
-                return_vec.push(return_genome_sketch);
-            } else {
-                warn!("File {} is not a valid fasta/fastq file", ref_file);
-                return vec![];
-            }
-        }
-        return return_vec;
     }
+    let mut reader = reader.unwrap();
+    let mut return_vec = vec![];
+    while let Some(record) = reader.next() {
+        if record.is_ok() {
+            let record = record.expect(&format!("Invalid record for file {} ", ref_file));
+            let mut sketcher =
+                GenomeSketcher::new(c, k, min_spacing, pseudotax, Seeding::Native);
+            sketcher.push_contig(record.id(), &record.seq());
+            return_vec.push(sketcher.finish(ref_file.to_string()));
+        } else {
+            warn!("File {} is not a valid fasta/fastq file", ref_file);
+            return vec![];
+        }
+    }
+    return return_vec;
 }
 
 pub fn sketch_genome(
@@ -556,71 +517,22 @@ pub fn sketch_genome(
     pseudotax: bool,
 ) -> Option<GenomeSketch> {
     let reader = parse_fastx_file(&ref_file);
-    let mut vec = vec![];
-    let mut pseudotax_track_kmers = vec![];
     if !reader.is_ok() {
         warn!("{} is not a valid fasta/fastq file; skipping.", ref_file);
         return None;
-    } else {
-        let mut reader = reader.unwrap();
-        let mut first = true;
-        let mut return_genome_sketch = GenomeSketch::default();
-        return_genome_sketch.c = c;
-        return_genome_sketch.k = k;
-        return_genome_sketch.file_name = ref_file.to_string();
-        let mut contig_number = 0;
-        while let Some(record) = reader.next() {
-            if record.is_ok() {
-                let record = record.expect(&format!("Invalid record for file {} ", ref_file));
-                if first {
-                    let contig_name = String::from_utf8_lossy(record.id()).to_string();
-                    let contig_name_notab = contig_name.replace('\t', " ");
-                    return_genome_sketch.first_contig_name = contig_name_notab.to_owned();
-                    first = false;
-                }
-                let seq = record.seq();
-
-                return_genome_sketch.gn_size += seq.len();
-                extract_markers_positions(&seq, &mut vec, c, k, contig_number);
-
-                contig_number += 1
-            } else {
-                warn!("File {} is not a valid fasta/fastq file", ref_file);
-                return None;
-            }
-        }
-        let mut kmer_set = MMHashSet::default();
-        let mut duplicate_set = MMHashSet::default();
-        let mut new_vec = Vec::with_capacity(vec.len());
-        vec.sort();
-        for (_, _, km) in vec.iter() {
-            if !kmer_set.contains(&km) {
-                kmer_set.insert(km);
-            } else {
-                duplicate_set.insert(km);
-            }
-        }
-
-        let mut last_pos = 0;
-        let mut last_contig = 0;
-        for (contig, pos, km) in vec.iter() {
-            if !duplicate_set.contains(&km) {
-                if last_pos == 0 || last_contig != *contig || pos - last_pos > min_spacing {
-                    new_vec.push(*km);
-                    last_contig = *contig;
-                    last_pos = *pos;
-                } else if pseudotax {
-                    pseudotax_track_kmers.push(*km);
-                }
-            }
-        }
-        return_genome_sketch.genome_kmers = new_vec;
-        return_genome_sketch.min_spacing = min_spacing;
-        if pseudotax {
-            return_genome_sketch.pseudotax_tracked_nonused_kmers = Some(pseudotax_track_kmers);
-        }
-        return Some(return_genome_sketch);
     }
+    let mut reader = reader.unwrap();
+    let mut sketcher = GenomeSketcher::new(c, k, min_spacing, pseudotax, Seeding::Native);
+    while let Some(record) = reader.next() {
+        if record.is_ok() {
+            let record = record.expect(&format!("Invalid record for file {} ", ref_file));
+            sketcher.push_contig(record.id(), &record.seq());
+        } else {
+            warn!("File {} is not a valid fasta/fastq file", ref_file);
+            return None;
+        }
+    }
+    Some(sketcher.finish(ref_file.to_string()))
 }
 
 pub fn sketch_pair_sequences(
@@ -631,36 +543,21 @@ pub fn sketch_pair_sequences(
     sample_name: Option<String>,
     no_dedup: bool,
     dedup_fpr: f64,
-) -> Option<SequencesSketch> {
+) -> Result<SequencesSketch, SketchError> {
     let r1o = parse_fastx_file(&read_file1);
     let r2o = parse_fastx_file(&read_file2);
-    let mut read_sketch = SequencesSketch::new(read_file1.to_string(), c, k, true, sample_name, 0.);
     if r1o.is_err() || r2o.is_err() {
         log::error!("Paired end reading failed for '{}' and '{}'. Make sure the files are present or the sequences are valid.", read_file1, read_file2);
-        std::process::exit(1);
+        return Err(SketchError::Input(format!(
+            "Paired end reading failed for '{}' and '{}'. Make sure the files are present or the sequences are valid.",
+            read_file1, read_file2
+        )));
     }
-
-    let mut num_dup_removed = 0;
 
     let mut reader1 = r1o.unwrap();
     let mut reader2 = r2o.unwrap();
-
-    //let mut kmer_pair_set = FxHashMap::default();
-    let mut kmer_pair_set = FxHashSet::default();
-    //let mut kmer_pair_set = GrowableBloom::new(0.001, 1_000_000_0);
-    let mut fpr = 0.001;
-    if dedup_fpr != 0. {
-        fpr = dedup_fpr;
-    }
-    let mut kmer_pair_set_approx = ScalableCuckooFilterBuilder::new()
-        .initial_capacity(1_000_000_0)
-        .false_positive_probability(fpr)
-        .hasher(FxHasher::default())
-        .rng(SmallRng::seed_from_u64(DEFAULT_RNG_SEED))
-        .finish();
-
-    let mut total_read_length: u64 = 0;
-    let mut num_read_pairs: u64 = 0;
+    let mut sketcher =
+        PairedReadSketcher::new(c, k, no_dedup, dedup_fpr, Seeding::Native)?;
 
     loop {
         let n1 = reader1.next();
@@ -669,87 +566,20 @@ pub fn sketch_pair_sequences(
             if let Some(rec2_o) = n2 {
                 if let Ok(rec1) = rec1_o {
                     if let Ok(rec2) = rec2_o {
-                        let mut temp_vec1 = vec![];
-                        let mut temp_vec2 = vec![];
-
-                        extract_markers(&rec1.seq(), &mut temp_vec1, c, k);
-                        extract_markers(&rec2.seq(), &mut temp_vec2, c, k);
-                        let kmer_pair = pair_kmer(&rec1.seq(), &rec2.seq());
-
-                        num_read_pairs += 1;
-                        total_read_length += rec1.seq().len() as u64 + rec2.seq().len() as u64;
-
-                        for km in temp_vec1.iter() {
-                            if dedup_fpr == 0. {
-                                dup_removal_lsh_full_exact(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                    None,
-                                );
-                            } else {
-                                dup_removal_lsh_full(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set_approx,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                );
-                            }
-                            //dup_removal_lsh(&mut read_sketch.kmer_counts, &mut kmer_pair_set, km, kmer_pair, &mut num_dup_removed, no_dedup);
-                        }
-                        for km in temp_vec2.iter() {
-                            if temp_vec1.contains(km) {
-                                continue;
-                            }
-                            if dedup_fpr == 0. {
-                                dup_removal_lsh_full_exact(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                    None,
-                                );
-                            } else {
-                                dup_removal_lsh_full(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set_approx,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                );
-                            }
-                            //dup_removal_lsh(&mut read_sketch.kmer_counts, &mut kmer_pair_set, km, kmer_pair, &mut num_dup_removed, no_dedup);
-                        }
+                        sketcher.push_pair(&rec1.seq(), &rec2.seq());
                     }
                 } else {
-                    return None;
+                    return Err(SketchError::Record(format!(
+                        "Invalid record for file {} ",
+                        read_file1
+                    )));
                 }
             }
         } else {
             break;
         }
     }
-    let percent = (num_dup_removed as f64)/((read_sketch.kmer_counts.values().sum::<u32>() as f64) + num_dup_removed as f64) * 100.;
-    log::debug!(
-        "Number of sketched k-mers removed due to read duplication for {}: {}. Percentage: {:.2}%",
-        read_sketch.file_name,
-        num_dup_removed,
-        percent,
-    );
-    read_sketch.mean_read_length = if num_read_pairs > 0 {
-        total_read_length as f64 / (2.0 * num_read_pairs as f64)
-    } else {
-        0.0
-    };
-    return Some(read_sketch);
+    Ok(sketcher.finish(read_file1.to_string(), sample_name))
 }
 
 pub fn sketch_sequences_needle(
@@ -759,59 +589,21 @@ pub fn sketch_sequences_needle(
     sample_name: Option<String>,
     no_dedup: bool,
 ) -> Option<SequencesSketch> {
-    let mut kmer_map = HashMap::default();
     let ref_file = &read_file;
     let reader = parse_fastx_file(&ref_file);
-    let mut mean_read_length = 0.;
-    let mut counter = 0.;
-    let mut kmer_to_pair_table = FxHashSet::default();
-    let mut num_dup_removed = 0;
-
     if !reader.is_ok() {
         warn!("{} is not a valid fasta/fastq file; skipping.", ref_file);
-        return None
-    } else {
-        let mut reader = reader.unwrap();
-        while let Some(record) = reader.next() {
-            if record.is_ok() {
-                let mut vec = vec![];
-                let record = record.expect(&format!("Invalid record for file {} ", ref_file));
-                let seq = record.seq();
-                let kmer_pair;
-                if seq.len() > 400 {
-                    kmer_pair = None;
-                } else {
-                    kmer_pair = pair_kmer_single(&seq);
-                }
-                extract_markers(&seq, &mut vec, c, k);
-                for km in vec {
-                    dup_removal_lsh_full_exact(
-                        &mut kmer_map,
-                        &mut kmer_to_pair_table,
-                        &km,
-                        kmer_pair,
-                        &mut num_dup_removed,
-                        no_dedup,
-                        Some(MAX_DEDUP_COUNT),
-                    );
-                }
-                //moving average
-                counter += 1.;
-                mean_read_length =
-                    mean_read_length + ((seq.len() as f64) - mean_read_length) / counter;
-            } else {
-                warn!("File {} is not a valid fasta/fastq file", ref_file);
-            }
+        return None;
+    }
+    let mut reader = reader.unwrap();
+    let mut sketcher = ReadSketcher::new(c, k, no_dedup, Seeding::Native);
+    while let Some(record) = reader.next() {
+        if record.is_ok() {
+            let record = record.expect(&format!("Invalid record for file {} ", ref_file));
+            sketcher.push_read(&record.seq());
+        } else {
+            warn!("File {} is not a valid fasta/fastq file", ref_file);
         }
     }
-
-    return Some(SequencesSketch {
-        kmer_counts: kmer_map,
-        file_name: read_file.to_string(),
-        c,
-        k,
-        paired: false,
-        sample_name: sample_name,
-        mean_read_length,
-    });
+    Some(sketcher.finish(read_file.to_string(), sample_name))
 }

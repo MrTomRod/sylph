@@ -828,7 +828,12 @@ fn get_seq_sketch(
                 let read_sketch_opt = if crate::parallel_sketch::should_use_pipeline(args.no_sketch_pipeline, threads, &read_file[0]) {
                     crate::parallel_sketch::sketch_pair_sequences_parallel(&read_file[0], &read_file[1], effective_c, args.k, None, false, DEFAULT_FPR, threads, &pipeline_params)
                 } else {
-                    sketch_pair_sequences(&read_file[0], &read_file[1], effective_c, args.k, None, false, DEFAULT_FPR)
+                    match sketch_pair_sequences(&read_file[0], &read_file[1], effective_c, args.k, None, false, DEFAULT_FPR) {
+                        Ok(sketch) => Some(sketch),
+                        // Already logged by the library; preserve the CLI's exit.
+                        Err(SketchError::Input(_)) => std::process::exit(1),
+                        Err(_) => None,
+                    }
                 };
                 return read_sketch_opt;
             }

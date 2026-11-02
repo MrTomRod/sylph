@@ -4,6 +4,7 @@ pub mod constants;
 pub mod types;
 pub mod seeding;
 pub mod kernels;
+pub mod sketchers;
 pub mod cmdline;
 pub mod contain;
 pub mod twostage_db;

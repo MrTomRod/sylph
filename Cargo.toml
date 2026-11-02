@@ -6,32 +6,75 @@ license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# Core (always compiled) dependencies: only what the sketch types, seeding
+# kernels, dedup kernels and streaming sketchers need. Everything below that
+# is `optional` is only required by the CLI (`cli` feature) or by the
+# approximate-dedup filter.
 [dependencies]
-needletail = "0.5.0"
-simple_logger=  { version = "3", features = ["stderr"] }
 log = "0"
-rayon = "1"
 smallvec = { version = "1", features = ["union","serde","write"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 fxhash = "0"
-boomphf = { version = "0.6", features = ["serde"] }
-clap = { version = "3", features = ["derive"] }
-termcolor = "1"
-flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false }
-statrs="0.16"
-nalgebra="0"
-rand = { version = "0.8", features = ["small_rng"] }
-regex = "1"
-fastrand = "2"
-memory-stats = "1"
-scalable_cuckoo_filter = "0.2"
-serde_yaml = "0.9"
-crossbeam-channel = "0.5"
+
+# Approximate (cuckoo-filter) read dedup, used by `sketch_pair_sequences` and
+# `PairedReadSketcher` when the dedup FPR is non-zero. This is a separate
+# feature because `scalable_cuckoo_filter` pulls in `rand` with its default
+# features, hence `getrandom`: a `--no-default-features` build is
+# getrandom-free (useful for wasm32-unknown-unknown), and downstream crates
+# that enable `approx-dedup` for wasm must enable getrandom's `js` (or
+# `custom`) feature in their own Cargo.toml.
+rand = { version = "0.8", default-features = false, features = ["small_rng"], optional = true }
+scalable_cuckoo_filter = { version = "0.2", optional = true }
+
+# CLI / I/O / profiling only.
+needletail = { version = "0.5.0", optional = true }
+simple_logger = { version = "3", features = ["stderr"], optional = true }
+rayon = { version = "1", optional = true }
+boomphf = { version = "0.6", features = ["serde"], optional = true }
+clap = { version = "3", features = ["derive"], optional = true }
+termcolor = { version = "1", optional = true }
+flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false, optional = true }
+statrs = { version = "0.16", optional = true }
+nalgebra = { version = "0", optional = true }
+regex = { version = "1", optional = true }
+fastrand = { version = "2", optional = true }
+memory-stats = { version = "1", optional = true }
+serde_yaml = { version = "0.9", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
-tikv-jemallocator = "0"
+tikv-jemallocator = { version = "0", optional = true }
 
+[features]
+default = ["cli"]
+# The command-line application (and the needletail/rayon/... based modules).
+cli = [
+    "dep:needletail",
+    "dep:simple_logger",
+    "dep:rayon",
+    "dep:boomphf",
+    "dep:clap",
+    "dep:termcolor",
+    "dep:flate2",
+    "dep:statrs",
+    "dep:nalgebra",
+    "dep:regex",
+    "dep:fastrand",
+    "dep:memory-stats",
+    "dep:serde_yaml",
+    "dep:crossbeam-channel",
+    "dep:tikv-jemallocator",
+    "approx-dedup",
+]
+# Approximate read deduplication via scalable_cuckoo_filter (implies rand and,
+# on wasm32-unknown-unknown, a downstream getrandom backend).
+approx-dedup = ["dep:scalable_cuckoo_filter", "dep:rand"]
+
+[[bin]]
+name = "sylph"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 assert_cmd = "1.0.1"

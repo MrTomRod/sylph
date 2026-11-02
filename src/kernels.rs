@@ -7,7 +7,9 @@
 //! from [`crate::sketch`] so existing import paths keep working.
 
 use crate::types::{Kmer, BYTE_TO_SEQ};
-use fxhash::{FxHashMap, FxHashSet, FxHasher};
+use fxhash::{FxHashMap, FxHashSet};
+#[cfg(feature = "approx-dedup")]
+use fxhash::FxHasher;
 
 pub type Marker = u32;
 
@@ -125,6 +127,12 @@ pub fn dup_removal_lsh_full_exact(
 }
 
 /// Approximate PCR-duplicate removal backed by a `scalable_cuckoo_filter`.
+///
+/// Only available with the `approx-dedup` feature (enabled by `cli`): the
+/// filter crate depends on `rand`'s default features, which pull in
+/// `getrandom`, so a getrandom-free (`--no-default-features`) build uses
+/// [`dup_removal_lsh_full_exact`] only.
+#[cfg(feature = "approx-dedup")]
 pub fn dup_removal_lsh_full<R: rand::Rng>(
     kmer_counts: &mut FxHashMap<Kmer, u32>,
     kmer_to_pair_set: &mut scalable_cuckoo_filter::ScalableCuckooFilter<

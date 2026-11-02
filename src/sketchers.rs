@@ -37,12 +37,20 @@
 
 use std::fmt;
 
-use fxhash::{FxHashMap, FxHashSet, FxHasher};
+use fxhash::{FxHashMap, FxHashSet};
+#[cfg(feature = "approx-dedup")]
+use fxhash::FxHasher;
+#[cfg(feature = "approx-dedup")]
 use rand::{rngs::SmallRng, SeedableRng};
+#[cfg(feature = "approx-dedup")]
 use scalable_cuckoo_filter::{ScalableCuckooFilter, ScalableCuckooFilterBuilder};
 
-use crate::constants::{DEFAULT_RNG_SEED, MAX_DEDUP_COUNT};
-use crate::kernels::{dup_removal_lsh_full, dup_removal_lsh_full_exact, pair_kmer, pair_kmer_single, Marker};
+#[cfg(feature = "approx-dedup")]
+use crate::constants::DEFAULT_RNG_SEED;
+use crate::constants::MAX_DEDUP_COUNT;
+#[cfg(feature = "approx-dedup")]
+use crate::kernels::dup_removal_lsh_full;
+use crate::kernels::{dup_removal_lsh_full_exact, pair_kmer, pair_kmer_single, Marker};
 use crate::seeding::{extract_markers_positions_with, extract_markers_with, Seeding};
 use crate::types::{GenomeSketch, Kmer, MMHashSet, SequencesSketch};
 
@@ -174,6 +182,7 @@ pub struct PairedReadSketcher {
     dedup: Dedup,
     kmer_counts: FxHashMap<Kmer, u32>,
     kmer_to_pair_set: FxHashSet<(u64, [Marker; 2])>,
+    #[cfg(feature = "approx-dedup")]
     approx_set: ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher, SmallRng>,
     num_dup_removed: usize,
     total_read_length: u64,
@@ -197,18 +206,28 @@ impl PairedReadSketcher {
         } else {
             Dedup::Approx
         };
-        let mut fpr = 0.001;
+        #[cfg(not(feature = "approx-dedup"))]
         if dedup_fpr != 0. {
-            fpr = dedup_fpr;
+            return Err(SketchError::Unsupported(
+                "approximate read deduplication (dedup_fpr != 0) requires the `approx-dedup` feature"
+                    .to_string(),
+            ));
         }
         // Built eagerly even in exact mode, as the original code did; it does
         // not influence the exact path's output.
-        let approx_set = ScalableCuckooFilterBuilder::new()
-            .initial_capacity(1_000_000_0)
-            .false_positive_probability(fpr)
-            .hasher(FxHasher::default())
-            .rng(SmallRng::seed_from_u64(DEFAULT_RNG_SEED))
-            .finish();
+        #[cfg(feature = "approx-dedup")]
+        let approx_set = {
+            let mut fpr = 0.001;
+            if dedup_fpr != 0. {
+                fpr = dedup_fpr;
+            }
+            ScalableCuckooFilterBuilder::new()
+                .initial_capacity(1_000_000_0)
+                .false_positive_probability(fpr)
+                .hasher(FxHasher::default())
+                .rng(SmallRng::seed_from_u64(DEFAULT_RNG_SEED))
+                .finish()
+        };
         Ok(PairedReadSketcher {
             c,
             k,
@@ -217,6 +236,7 @@ impl PairedReadSketcher {
             dedup,
             kmer_counts: FxHashMap::default(),
             kmer_to_pair_set: FxHashSet::default(),
+            #[cfg(feature = "approx-dedup")]
             approx_set,
             num_dup_removed: 0,
             total_read_length: 0,
@@ -271,6 +291,7 @@ impl PairedReadSketcher {
                     None,
                 );
             }
+            #[cfg(feature = "approx-dedup")]
             Dedup::Approx => {
                 let Self {
                     kmer_counts,
@@ -288,6 +309,8 @@ impl PairedReadSketcher {
                     *no_dedup,
                 );
             }
+            #[cfg(not(feature = "approx-dedup"))]
+            Dedup::Approx => unreachable!("approximate dedup requires the `approx-dedup` feature"),
         }
     }
 
@@ -445,3 +468,4 @@ impl GenomeSketcher {
         }
     }
 }
+

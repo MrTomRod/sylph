@@ -469,3 +469,199 @@ impl GenomeSketcher {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random_seq(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..len).map(|_| b"ACGT"[(next() % 4) as usize]).collect()
+    }
+
+    #[test]
+    fn read_sketcher_dedups_repeated_reads_and_tracks_mean_length() {
+        let read = random_seq(1, 200);
+        let other = random_seq(2, 100);
+
+        let mut sketcher = ReadSketcher::new(1, 21, false, Seeding::Avx2Compat);
+        for _ in 0..4 {
+            sketcher.push_read(&read);
+        }
+        sketcher.push_read(&other);
+        // Every observation after the first of each duplicate signature pair is
+        // dropped, so counts are 1 (the MAX_DEDUP_COUNT escape is not reached
+        // for c = 1).
+        assert!(sketcher.kmer_counts().values().all(|&c| c == 1));
+        assert!(sketcher.num_dup_removed() > 0);
+        assert_eq!(sketcher.num_reads(), 5);
+        assert_eq!(sketcher.mean_read_length(), (4.0 * 200.0 + 100.0) / 5.0);
+
+        let sketched = sketcher.finish("reads.fq".to_string(), Some("sample".into()));
+        assert_eq!(sketched.file_name, "reads.fq");
+        assert_eq!(sketched.sample_name.as_deref(), Some("sample"));
+        assert!(!sketched.paired);
+        assert_eq!(sketched.c, 1);
+        assert_eq!(sketched.k, 21);
+
+        // --no-dedup keeps every observation.
+        let mut sketcher = ReadSketcher::new(1, 21, true, Seeding::Avx2Compat);
+        for _ in 0..4 {
+            sketcher.push_read(&read);
+        }
+        assert_eq!(sketcher.num_dup_removed(), 0);
+        assert!(sketcher.kmer_counts().values().all(|&c| c == 4));
+    }
+
+    #[test]
+    fn paired_sketcher_exact_and_approx_paths() {
+        let r1 = random_seq(3, 150);
+        let r2 = random_seq(4, 150);
+
+        let fprs: &[f64] = if cfg!(feature = "approx-dedup") {
+            &[0.0, 0.001]
+        } else {
+            &[0.0]
+        };
+        for &dedup_fpr in fprs {
+            let mut sketcher = PairedReadSketcher::new(50, 21, false, dedup_fpr, Seeding::Native)
+                .unwrap();
+            for _ in 0..3 {
+                sketcher.push_pair(&r1, &r2);
+            }
+            let sketch = sketcher.finish("pair_1.fq".to_string(), None);
+            assert!(sketch.paired);
+            assert_eq!(sketch.mean_read_length, 150.0);
+            // Repeated mate pairs are deduplicated away (up to the filter's
+            // false-positive rate in approximate mode).
+            assert!(sketch.kmer_counts.values().all(|&c| c == 1));
+        }
+    }
+
+    #[test]
+    fn genome_sketcher_duplicates_spacing_and_pseudotax() {
+        let first = random_seq(5, 5000);
+        let second = random_seq(6, 4000);
+
+        let mut sketcher = GenomeSketcher::new(20, 21, 30, true, Seeding::Avx2Compat);
+        sketcher.push_contig(b"contig\tone", &first);
+        sketcher.push_contig(b"contig2", &second);
+        let sketch = sketcher.finish("genome.fa".to_string());
+        assert_eq!(sketch.first_contig_name, "contig one");
+        assert_eq!(sketch.gn_size, 9000);
+        assert_eq!(sketch.min_spacing, 30);
+        assert!(!sketch.genome_kmers.is_empty());
+        // pseudotax tracking is enabled, so the field exists (it may be empty)
+        assert!(sketch.pseudotax_tracked_nonused_kmers.is_some());
+
+        // A tandem repeat has every k-mer more than once -> nothing survives.
+        let unit = random_seq(7, 100);
+        let tandem: Vec<u8> = unit.iter().copied().cycle().take(3000).collect();
+        let mut sketcher = GenomeSketcher::new(1, 21, 30, false, Seeding::Avx2Compat);
+        sketcher.push_contig(b"tandem", &tandem);
+        let sketch = sketcher.finish("tandem.fa".to_string());
+        assert!(sketch.genome_kmers.is_empty());
+        assert!(sketch.pseudotax_tracked_nonused_kmers.is_none());
+
+        // A single record sketched on its own matches the one-shot path
+        // (GenomeSketcher::push_contig is what sketch_genome_individual does).
+        let mut one = GenomeSketcher::new(20, 21, 0, false, Seeding::Avx2Compat);
+        one.push_contig(b"only", &first);
+        let a = one.finish("one.fa".to_string());
+        let mut two = GenomeSketcher::new(20, 21, 0, false, Seeding::Avx2Compat);
+        two.push_contig(b"only", &first);
+        let b = two.finish("one.fa".to_string());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn unspaced_genome_keeps_all_unique_kmers() {
+        let seq = random_seq(8, 2000);
+        let dense = {
+            let mut s = GenomeSketcher::new(1, 21, 0, false, Seeding::Avx2Compat);
+            s.push_contig(b"c", &seq);
+            s.finish(String::new()).genome_kmers
+        };
+        let spaced = {
+            let mut s = GenomeSketcher::new(1, 21, 30, false, Seeding::Avx2Compat);
+            s.push_contig(b"c", &seq);
+            s.finish(String::new()).genome_kmers
+        };
+        assert!(spaced.len() < dense.len());
+        // deterministic across runs
+        let dense2 = {
+            let mut s = GenomeSketcher::new(1, 21, 0, false, Seeding::Avx2Compat);
+            s.push_contig(b"c", &seq);
+            s.finish(String::new()).genome_kmers
+        };
+        assert_eq!(dense, dense2);
+    }
+}
+
+/// The path-based wrappers must remain exactly the streaming sketchers driven
+/// by needletail; these tests pin that for the repository's test data.
+#[cfg(all(test, feature = "cli"))]
+mod path_tests {
+    use super::*;
+    use needletail::parse_fastx_file;
+
+    fn drive_reads(path: &str, c: usize, k: usize, no_dedup: bool) -> SequencesSketch {
+        let mut sketcher = ReadSketcher::new(c, k, no_dedup, Seeding::Native);
+        let mut reader = parse_fastx_file(path).unwrap();
+        while let Some(record) = reader.next() {
+            let record = record.unwrap();
+            sketcher.push_read(&record.seq());
+        }
+        sketcher.finish(path.to_string(), None)
+    }
+
+    #[test]
+    fn read_path_matches_streaming_sketcher() {
+        let path = "test_files/t1.fq";
+        for no_dedup in [false, true] {
+            let direct = crate::sketch::sketch_sequences_needle(path, 200, 31, None, no_dedup)
+                .expect("t1.fq should be readable");
+            assert_eq!(direct, drive_reads(path, 200, 31, no_dedup));
+        }
+    }
+
+    #[test]
+    fn paired_path_matches_streaming_sketcher() {
+        let (p1, p2) = ("test_files/t1.fq", "test_files/t2.fq");
+        for (no_dedup, fpr) in [(false, 0.0), (false, crate::constants::DEFAULT_FPR), (true, 0.0)]
+        {
+            let direct = crate::sketch::sketch_pair_sequences(p1, p2, 200, 31, None, no_dedup, fpr)
+                .expect("test pairs should be readable");
+            let mut sketcher =
+                PairedReadSketcher::new(200, 31, no_dedup, fpr, Seeding::Native).unwrap();
+            let mut r1 = parse_fastx_file(p1).unwrap();
+            let mut r2 = parse_fastx_file(p2).unwrap();
+            while let (Some(a), Some(b)) = (r1.next(), r2.next()) {
+                sketcher.push_pair(&a.unwrap().seq(), &b.unwrap().seq());
+            }
+            assert_eq!(direct, sketcher.finish(p1.to_string(), None));
+        }
+    }
+
+    #[test]
+    fn genome_path_matches_streaming_sketcher() {
+        let path = "test_files/tiny_virus.fasta";
+        for pseudotax in [false, true] {
+            let direct = crate::sketch::sketch_genome(200, 31, path, 30, pseudotax)
+                .expect("tiny_virus.fasta should be readable");
+            let mut sketcher = GenomeSketcher::new(200, 31, 30, pseudotax, Seeding::Native);
+            let mut reader = parse_fastx_file(path).unwrap();
+            while let Some(record) = reader.next() {
+                let record = record.unwrap();
+                sketcher.push_contig(record.id(), &record.seq());
+            }
+            assert_eq!(direct, sketcher.finish(path.to_string()));
+        }
+    }
+}

@@ -210,18 +210,36 @@ pub fn fmh_seeds_positions(
 
 /// Which seeding kernel [`extract_markers`] / [`extract_markers_positions`]
 /// should use.
+///
+/// Both kernels require `c > 0` (the k-mer downsampling threshold is
+/// `u64::MAX / c`) and only support `k` up to 32 on the scalar path. In
+/// practice every sylph build so far uses `k = 21` or `k = 31`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Seeding {
     /// Whatever this build does natively: sylph's AVX2 kernel on x86_64 CPUs
     /// that support AVX2, the scalar kernel everywhere else. This is the
     /// behaviour the `sylph` CLI has always had.
+    ///
+    /// On an AVX2-capable host, `k` must be 21 or 31: the AVX2 kernel derives
+    /// its shift constants from `2 * (k - 1)` and panics for any other `k`
+    /// once a sequence is long enough to enter the kernel body (at least
+    /// `k + 1` bases for marker extraction, at least `2 * k` for marker
+    /// positions). Shorter sequences return no markers before that check, so
+    /// they do not panic. On hosts without AVX2 the scalar kernel is used,
+    /// which works for `k <= 32` but yields different k-mers than the AVX2
+    /// kernel.
     #[default]
     Native,
     /// Portable scalar emulation of the x86_64 AVX2 kernel.
     ///
     /// It produces exactly the k-mers the AVX2 kernel produces, in exactly the
     /// same order, on every architecture (so browser/wasm and aarch64 builds
-    /// can reproduce x86_64 sketches). See [`fmh_seeds_avx2_compat`].
+    /// can reproduce x86_64 sketches). See [`fmh_seeds_avx2_compat`] and
+    /// [`fmh_seeds_avx2_compat_positions`].
+    ///
+    /// Only `k = 21` and `k = 31` are guaranteed to match the AVX2 kernel
+    /// (the AVX2 kernel accepts no other value; the scalar kernel itself
+    /// supports `k <= 32`).
     Avx2Compat,
 }
 
@@ -311,8 +329,15 @@ pub fn extract_markers_positions(
 /// * appends k-mers in the interleaved segment order above (which matters for
 ///   sylph's order-dependent read deduplication).
 ///
-/// This function reproduces that output exactly and portably. It assumes
-/// `k <= 31`, like the AVX2 kernel (signed 64-bit comparisons are used there).
+/// This function reproduces that output exactly and portably for `k = 21` and
+/// `k = 31`, the only two values the AVX2 kernel accepts: it picks its shift
+/// constants from `2 * (k - 1)` and `panic!()`s for any other `k` once a
+/// sequence is long enough to reach the kernel body (at least `k + 1` bases
+/// here; at least `2 * k` for [`fmh_seeds_avx2_compat_positions`]). Shorter
+/// inputs return early, before the AVX2 kernel's `k` check, so they are
+/// silently empty rather than a panic. For other `k` values this function
+/// still runs, but its output is not a compatibility guarantee for any real
+/// sylph build.
 pub fn fmh_seeds_avx2_compat(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
     if string.len() < k + 1 {
         return;
@@ -412,8 +437,10 @@ mod tests {
         (0..len).map(|_| b"ACGT"[(next() % 4) as usize]).collect()
     }
 
-    /// Includes ambiguous `N`s, lower-case bases and IUPAC codes, all of which
-    /// `BYTE_TO_SEQ` maps to `A` (as in sylph).
+    /// Includes ambiguous `N`s, lower-case bases and IUPAC codes. `BYTE_TO_SEQ`
+    /// maps `N` and the other non-ACGT bytes to `A`, while lower-case
+    /// `a`/`c`/`g`/`t` map to the same codes as their upper-case forms
+    /// (so a lower-case `c`/`g`/`t` is *not* turned into `A`).
     fn noisy_read(seed: u64, len: usize) -> Vec<u8> {
         let mut read = random_read(seed, len);
         for (i, b) in read.iter_mut().enumerate() {
@@ -453,37 +480,42 @@ mod tests {
                 1000,
                 4099,
             ];
-            for (n, &len) in lengths.iter().enumerate() {
-                for (kind, read) in [
-                    ("acgt", random_read(len as u64 * 31 + k as u64 + n as u64, len)),
-                    ("noisy", noisy_read(len as u64 * 17 + k as u64 + n as u64, len)),
-                ] {
-                    let mut native = Vec::new();
-                    let mut compat = Vec::new();
-                    unsafe {
-                        crate::avx2_seeding::extract_markers_avx2(
-                            &read,
-                            &mut native,
-                            /*c=*/ 1,
-                            k,
-                        );
-                    }
-                    fmh_seeds_avx2_compat(&read, &mut compat, 1, k);
-                    assert_eq!(native, compat, "markers k={k} len={len} kind={kind}");
+            for c in [1usize, 5, 100, 200] {
+                for (n, &len) in lengths.iter().enumerate() {
+                    for (kind, read) in [
+                        ("acgt", random_read(len as u64 * 31 + k as u64 + n as u64, len)),
+                        ("noisy", noisy_read(len as u64 * 17 + k as u64 + n as u64, len)),
+                    ] {
+                        let mut native = Vec::new();
+                        let mut compat = Vec::new();
+                        unsafe {
+                            crate::avx2_seeding::extract_markers_avx2(
+                                &read,
+                                &mut native,
+                                c,
+                                k,
+                            );
+                        }
+                        fmh_seeds_avx2_compat(&read, &mut compat, c, k);
+                        assert_eq!(native, compat, "markers k={k} len={len} c={c} kind={kind}");
 
-                    let mut native = Vec::new();
-                    let mut compat = Vec::new();
-                    unsafe {
-                        crate::avx2_seeding::extract_markers_avx2_positions(
-                            &read,
-                            &mut native,
-                            1,
-                            k,
-                            /*contig_number=*/ 3,
+                        let mut native = Vec::new();
+                        let mut compat = Vec::new();
+                        unsafe {
+                            crate::avx2_seeding::extract_markers_avx2_positions(
+                                &read,
+                                &mut native,
+                                c,
+                                k,
+                                /*contig_number=*/ 3,
+                            );
+                        }
+                        fmh_seeds_avx2_compat_positions(&read, &mut compat, c, k, 3);
+                        assert_eq!(
+                            native, compat,
+                            "positions k={k} len={len} c={c} kind={kind}"
                         );
                     }
-                    fmh_seeds_avx2_compat_positions(&read, &mut compat, 1, k, 3);
-                    assert_eq!(native, compat, "positions k={k} len={len} kind={kind}");
                 }
             }
         }

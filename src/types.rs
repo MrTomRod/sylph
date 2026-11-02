@@ -58,9 +58,16 @@ pub const BYTE_TO_SEQ: [u8; 256] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
+/// minimap2-style integer hash, always computed on 64 bits so that it is
+/// independent of the target's pointer width (e.g. wasm32). Inputs shorter
+/// than 8 bytes are zero-padded; for the 8-byte keys sylph hashes, the result
+/// is identical to the previous `usize`-based implementation on 64-bit targets.
 #[inline]
-pub fn mm_hash(bytes: &[u8]) -> usize {
-    let mut key = usize::from_ne_bytes(bytes.try_into().unwrap()) as usize;
+fn mm_hash_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = bytes.len().min(8);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    let mut key = u64::from_ne_bytes(buf);
     key = (!key).wrapping_add(key << 21); // key = (key << 21) - key - 1;
     key = key ^ key >> 24;
     key = (key.wrapping_add(key << 3)).wrapping_add(key << 8); // key * 265
@@ -68,21 +75,26 @@ pub fn mm_hash(bytes: &[u8]) -> usize {
     key = (key.wrapping_add(key << 2)).wrapping_add(key << 4); // key * 21
     key = key ^ key >> 28;
     key = key.wrapping_add(key << 31);
-    return key;
+    key
+}
+
+#[inline]
+pub fn mm_hash(bytes: &[u8]) -> usize {
+    mm_hash_u64(bytes) as usize
 }
 
 pub struct MMHasher {
-    hash: usize,
+    hash: u64,
 }
 
 impl Hasher for MMHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        self.hash = mm_hash(bytes);
+        self.hash = mm_hash_u64(bytes);
     }
     #[inline]
     fn finish(&self) -> u64 {
-        self.hash as u64
+        self.hash
     }
 }
 

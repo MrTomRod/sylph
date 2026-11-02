@@ -28,6 +28,9 @@
 //!   dedup at `dedup_fpr` (`0.0` selects the exact set, any other value the
 //!   seeded cuckoo filter), cross-mate suppression of identical k-mer hashes
 //!   within a pair, and `mean_read_length = total_bases / (2 * pairs)`.
+//!   (pysylph's `sketch_paired` instead tracks a moving average of the first
+//!   mate's length; a caller that needs that can ignore
+//!   [`SequencesSketch::mean_read_length`] and average its own lengths.)
 //! * [`GenomeSketcher`] reproduces `sketch_genome` over all contigs, or
 //!   `sketch_genome_individual` if you use one sketcher per record: markers
 //!   from every contig are sorted together, k-mers occurring more than once
@@ -387,7 +390,9 @@ impl GenomeSketcher {
     }
 
     /// Adds one contig. `name` is only used for the first contig of the
-    /// genome (`first_contig_name`); tabs become spaces as before.
+    /// genome (`first_contig_name`); tabs become spaces as before. Pass
+    /// `b""` when the caller has no record names (pysylph's contig list);
+    /// the field then stays empty, as in pysylph's `sketch_genome`.
     pub fn push_contig(&mut self, name: &[u8], seq: &[u8]) {
         if self.contig_number == 0 {
             self.first_contig_name = String::from_utf8_lossy(name).to_string().replace('\t', " ");

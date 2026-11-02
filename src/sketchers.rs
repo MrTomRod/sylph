@@ -104,6 +104,12 @@ pub struct ReadSketcher {
 }
 
 impl ReadSketcher {
+    /// `c` is the seeding downsampling factor and must be `> 0`; the kernels
+    /// compute `u64::MAX / c`, so `c = 0` panics (division by zero). `k` must
+    /// be positive; sylph's sketches are defined for `k = 21` or `k = 31`, and
+    /// with [`Seeding::Native`] on an AVX2-capable x86_64 host any other `k`
+    /// panics as soon as a read has at least `k + 1` bases (see
+    /// [`Seeding::Native`]).
     pub fn new(c: usize, k: usize, no_dedup: bool, seeding: Seeding) -> Self {
         ReadSketcher {
             c,
@@ -197,6 +203,12 @@ pub struct PairedReadSketcher {
 impl PairedReadSketcher {
     /// `dedup_fpr == 0.0` uses the exact dedup set; any other value uses the
     /// approximate (cuckoo filter) one, exactly like `sketch_pair_sequences`.
+    ///
+    /// `c` must be `> 0`; the kernels compute `u64::MAX / c`, so `c = 0`
+    /// panics (division by zero). `k` must be positive; use `21` or `31`, the
+    /// values sylph's sketches are defined for. With [`Seeding::Native`] on an
+    /// AVX2-capable x86_64 host any other `k` panics once a mate has at least
+    /// `k + 1` bases (see [`Seeding::Native`]).
     pub fn new(
         c: usize,
         k: usize,
@@ -375,6 +387,16 @@ pub struct GenomeSketcher {
 }
 
 impl GenomeSketcher {
+    /// `c` is the seeding downsampling factor and must be `> 0`; the kernels
+    /// compute `u64::MAX / c`, so `c = 0` panics (division by zero). `k` must
+    /// be positive; use `21` or `31`, the values sylph's sketches are defined
+    /// for. With [`Seeding::Native`] on an AVX2-capable x86_64 host any other
+    /// `k` panics once a contig has at least `k + 1` bases (marker
+    /// extraction) or at least `2 * k` bases (marker positions, i.e. genome
+    /// sketches), see [`Seeding::Native`].
+    ///
+    /// `min_spacing` is the greedy minimum distance (in k-mer end positions)
+    /// between two retained markers on the same contig; `0` disables it.
     pub fn new(c: usize, k: usize, min_spacing: usize, pseudotax: bool, seeding: Seeding) -> Self {
         GenomeSketcher {
             c,

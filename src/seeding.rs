@@ -207,3 +207,318 @@ pub fn fmh_seeds_positions(
         }
     }
 }
+
+/// Which seeding kernel [`extract_markers`] / [`extract_markers_positions`]
+/// should use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Seeding {
+    /// Whatever this build does natively: sylph's AVX2 kernel on x86_64 CPUs
+    /// that support AVX2, the scalar kernel everywhere else. This is the
+    /// behaviour the `sylph` CLI has always had.
+    #[default]
+    Native,
+    /// Portable scalar emulation of the x86_64 AVX2 kernel.
+    ///
+    /// It produces exactly the k-mers the AVX2 kernel produces, in exactly the
+    /// same order, on every architecture (so browser/wasm and aarch64 builds
+    /// can reproduce x86_64 sketches). See [`fmh_seeds_avx2_compat`].
+    Avx2Compat,
+}
+
+/// As [`extract_markers`], with an explicit seeding strategy.
+pub fn extract_markers_with(
+    seeding: Seeding,
+    string: &[u8],
+    kmer_vec: &mut Vec<u64>,
+    c: usize,
+    k: usize,
+) {
+    match seeding {
+        Seeding::Avx2Compat => fmh_seeds_avx2_compat(string, kmer_vec, c, k),
+        Seeding::Native => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    use crate::avx2_seeding::*;
+                    unsafe {
+                        extract_markers_avx2(string, kmer_vec, c, k);
+                    }
+                    return;
+                }
+            }
+            fmh_seeds(string, kmer_vec, c, k);
+        }
+    }
+}
+
+/// Appends the hashed canonical k-mers of `string` to `kmer_vec` using this
+/// build's native seeding kernel (AVX2 on x86_64 when available, scalar
+/// otherwise).
+pub fn extract_markers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+    extract_markers_with(Seeding::Native, string, kmer_vec, c, k);
+}
+
+/// As [`extract_markers_positions`], with an explicit seeding strategy.
+pub fn extract_markers_positions_with(
+    seeding: Seeding,
+    string: &[u8],
+    kmer_vec: &mut Vec<(usize, usize, u64)>,
+    c: usize,
+    k: usize,
+    contig_number: usize,
+) {
+    match seeding {
+        Seeding::Avx2Compat => {
+            fmh_seeds_avx2_compat_positions(string, kmer_vec, c, k, contig_number)
+        }
+        Seeding::Native => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    use crate::avx2_seeding::*;
+                    unsafe {
+                        extract_markers_avx2_positions(string, kmer_vec, c, k, contig_number);
+                    }
+                    return;
+                }
+            }
+            fmh_seeds_positions(string, kmer_vec, c, k, contig_number);
+        }
+    }
+}
+
+/// Appends `(contig_number, k-mer end position, hash)` markers using this
+/// build's native seeding kernel.
+pub fn extract_markers_positions(
+    string: &[u8],
+    kmer_vec: &mut Vec<(usize, usize, u64)>,
+    c: usize,
+    k: usize,
+    contig_number: usize,
+) {
+    extract_markers_positions_with(Seeding::Native, string, kmer_vec, c, k, contig_number);
+}
+
+/// Scalar emulation of sylph's x86_64 `avx2_seeding::extract_markers_avx2`.
+///
+/// The AVX2 kernel splits the `n - k + 1` k-mer start positions of a read into
+/// four equal segments of `(n - k + 1) / 4` positions and processes them in
+/// lock-step, one k-mer of each segment per step, in segment order. As a
+/// consequence it
+///
+/// * never sees the last `(n - k + 1) % 4` k-mers of a read,
+/// * yields nothing for a read of exactly `k` bases (or shorter), and
+/// * appends k-mers in the interleaved segment order above (which matters for
+///   sylph's order-dependent read deduplication).
+///
+/// This function reproduces that output exactly and portably. It assumes
+/// `k <= 31`, like the AVX2 kernel (signed 64-bit comparisons are used there).
+pub fn fmh_seeds_avx2_compat(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+    if string.len() < k + 1 {
+        return;
+    }
+    let seg = (string.len() - k + 1) / 4;
+    if seg == 0 {
+        return;
+    }
+    let reverse_shift = 2 * (k - 1);
+    let mask = u64::MAX >> (64 - 2 * k);
+    let rev_mask = !(3u64 << (2 * k - 2));
+    let threshold = u64::MAX / (c as u64);
+
+    let mut f = [0u64; 4];
+    let mut r = [0u64; 4];
+    for i in 0..k - 1 {
+        for s in 0..4 {
+            let nuc_f = BYTE_TO_SEQ[string[s * seg + i] as usize] as u64;
+            f[s] = (f[s] << 2) | nuc_f;
+            r[s] = (r[s] >> 2) | ((3 - nuc_f) << reverse_shift);
+        }
+    }
+    for i in k - 1..seg + k - 1 {
+        for s in 0..4 {
+            let nuc_f = BYTE_TO_SEQ[string[s * seg + i] as usize] as u64;
+            f[s] = ((f[s] << 2) | nuc_f) & mask;
+            r[s] = ((r[s] >> 2) & rev_mask) | ((3 - nuc_f) << reverse_shift);
+            let hash = mm_hash64(f[s].min(r[s]));
+            if hash < threshold {
+                kmer_vec.push(hash);
+            }
+        }
+    }
+}
+
+/// Scalar emulation of sylph's x86_64
+/// `avx2_seeding::extract_markers_avx2_positions`.
+///
+/// Same segment/tail behaviour as [`fmh_seeds_avx2_compat`], plus the AVX2
+/// positions kernel's additional rule: a read shorter than `2 * k` yields
+/// nothing at all. Positions are the k-mer end offsets (`segment start + i`),
+/// as in the AVX2 kernel.
+pub fn fmh_seeds_avx2_compat_positions(
+    string: &[u8],
+    kmer_vec: &mut Vec<(usize, usize, u64)>,
+    c: usize,
+    k: usize,
+    contig_number: usize,
+) {
+    if string.len() < k {
+        return;
+    }
+    let seg = (string.len() - k + 1) / 4;
+    if string.len() < 2 * k || seg == 0 {
+        return;
+    }
+    let reverse_shift = 2 * (k - 1);
+    let mask = u64::MAX >> (64 - 2 * k);
+    let rev_mask = !(3u64 << (2 * k - 2));
+    let threshold = u64::MAX / (c as u64);
+
+    let mut f = [0u64; 4];
+    let mut r = [0u64; 4];
+    for i in 0..k - 1 {
+        for s in 0..4 {
+            let nuc_f = BYTE_TO_SEQ[string[s * seg + i] as usize] as u64;
+            f[s] = (f[s] << 2) | nuc_f;
+            r[s] = (r[s] >> 2) | ((3 - nuc_f) << reverse_shift);
+        }
+    }
+    for i in k - 1..seg + k - 1 {
+        for s in 0..4 {
+            let nuc_f = BYTE_TO_SEQ[string[s * seg + i] as usize] as u64;
+            f[s] = ((f[s] << 2) | nuc_f) & mask;
+            r[s] = ((r[s] >> 2) & rev_mask) | ((3 - nuc_f) << reverse_shift);
+            let hash = mm_hash64(f[s].min(r[s]));
+            if hash < threshold {
+                kmer_vec.push((contig_number, s * seg + i, hash));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-random read (xorshift).
+    fn random_read(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..len).map(|_| b"ACGT"[(next() % 4) as usize]).collect()
+    }
+
+    /// Includes ambiguous `N`s, lower-case bases and IUPAC codes, all of which
+    /// `BYTE_TO_SEQ` maps to `A` (as in sylph).
+    fn noisy_read(seed: u64, len: usize) -> Vec<u8> {
+        let mut read = random_read(seed, len);
+        for (i, b) in read.iter_mut().enumerate() {
+            if i % 37 == 0 {
+                *b = b'N';
+            } else if i % 53 == 0 {
+                *b = b.to_ascii_lowercase();
+            } else if i % 89 == 0 {
+                *b = b'R';
+            }
+        }
+        read
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_compat_matches_avx2_seeding() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("AVX2 not available; skipping AVX2 parity test");
+            return;
+        }
+        for k in [21usize, 31] {
+            let lengths = [
+                k - 1,
+                k,
+                k + 1,
+                k + 2,
+                2 * k - 1,
+                2 * k,
+                2 * k + 1,
+                4 * k - 1,
+                4 * k,
+                100,
+                103,
+                105,
+                157,
+                1000,
+                4099,
+            ];
+            for (n, &len) in lengths.iter().enumerate() {
+                for (kind, read) in [
+                    ("acgt", random_read(len as u64 * 31 + k as u64 + n as u64, len)),
+                    ("noisy", noisy_read(len as u64 * 17 + k as u64 + n as u64, len)),
+                ] {
+                    let mut native = Vec::new();
+                    let mut compat = Vec::new();
+                    unsafe {
+                        crate::avx2_seeding::extract_markers_avx2(
+                            &read,
+                            &mut native,
+                            /*c=*/ 1,
+                            k,
+                        );
+                    }
+                    fmh_seeds_avx2_compat(&read, &mut compat, 1, k);
+                    assert_eq!(native, compat, "markers k={k} len={len} kind={kind}");
+
+                    let mut native = Vec::new();
+                    let mut compat = Vec::new();
+                    unsafe {
+                        crate::avx2_seeding::extract_markers_avx2_positions(
+                            &read,
+                            &mut native,
+                            1,
+                            k,
+                            /*contig_number=*/ 3,
+                        );
+                    }
+                    fmh_seeds_avx2_compat_positions(&read, &mut compat, 1, k, 3);
+                    assert_eq!(native, compat, "positions k={k} len={len} kind={kind}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_compat_drops_the_tail_and_short_reads() {
+        for k in [21usize, 31] {
+            let read = random_read(k as u64, 4 * k + 3);
+            // shorter than k: nothing
+            let mut out = Vec::new();
+            fmh_seeds_avx2_compat(&read[..k - 1], &mut out, 1, k);
+            assert!(out.is_empty());
+            // exactly k: nothing
+            let mut out = Vec::new();
+            fmh_seeds_avx2_compat(&read[..k], &mut out, 1, k);
+            assert!(out.is_empty());
+            // positions: nothing below 2k
+            let mut out = Vec::new();
+            fmh_seeds_avx2_compat_positions(&read[..2 * k - 1], &mut out, 1, k, 0);
+            assert!(out.is_empty());
+
+            // n - k + 1 not divisible by 4: exactly 4 * ((n - k + 1) / 4)
+            // k-mers of the scalar path remain (before c-subsampling).
+            let mut scalar = Vec::new();
+            fmh_seeds(&read, &mut scalar, 1, k);
+            let mut compat = Vec::new();
+            fmh_seeds_avx2_compat(&read, &mut compat, 1, k);
+            assert_eq!(compat.len(), 4 * ((read.len() - k + 1) / 4));
+            // every compat k-mer is also a scalar k-mer (as a multiset)
+            let mut scalar_sorted = scalar.clone();
+            scalar_sorted.sort_unstable();
+            let mut compat_sorted = compat.clone();
+            compat_sorted.sort_unstable();
+            assert!(compat_sorted.iter().all(|h| scalar_sorted.contains(h)));
+        }
+    }
+}

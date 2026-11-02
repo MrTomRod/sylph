@@ -46,7 +46,7 @@ use crate::sketch::{
 };
 use crate::types::*;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use fxhash::{FxHashMap, FxHashSet, FxHasher};
+use fxhash::{FxHashMap, FxHashSet, FxHasher64};
 use log::*;
 use needletail::parser::FastxReader;
 use needletail::parse_fastx_file;
@@ -96,7 +96,7 @@ enum Dedup {
     Exact(FxHashSet<(u64, [Marker; 2])>),
     // Boxed: keeps this arm from bloating the enum when Exact (single-end,
     // and paired-end at --fpr 0) is the common case.
-    Approx(Box<ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher, SmallRng>>),
+    Approx(Box<ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher64, SmallRng>>),
 }
 
 struct ShardState {
@@ -130,7 +130,7 @@ fn build_shards_approx(num_shards: usize, dedup_fpr: f64) -> Vec<Shard> {
             let filter = ScalableCuckooFilterBuilder::new()
                 .initial_capacity(cap)
                 .false_positive_probability(fpr)
-                .hasher(FxHasher::default())
+                .hasher(FxHasher64::default())
                 // Keep approximate dedup repeatable while giving independent
                 // shards distinct relocation streams.
                 .rng(SmallRng::seed_from_u64(

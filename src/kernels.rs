@@ -9,7 +9,7 @@
 use crate::types::{Kmer, BYTE_TO_SEQ};
 use fxhash::{FxHashMap, FxHashSet};
 #[cfg(feature = "approx-dedup")]
-use fxhash::FxHasher;
+use fxhash::FxHasher64;
 
 pub type Marker = u32;
 
@@ -132,12 +132,16 @@ pub fn dup_removal_lsh_full_exact(
 /// filter crate depends on `rand`'s default features, which pull in
 /// `getrandom`, so a getrandom-free (`--no-default-features`) build uses
 /// [`dup_removal_lsh_full_exact`] only.
+///
+/// The filter must be hashed with the 64-bit `FxHasher64` (not the
+/// pointer-width `FxHasher`), because the filter derives its fingerprints
+/// from the hash's top bits; see `PairedReadSketcher`.
 #[cfg(feature = "approx-dedup")]
 pub fn dup_removal_lsh_full<R: rand::Rng>(
     kmer_counts: &mut FxHashMap<Kmer, u32>,
     kmer_to_pair_set: &mut scalable_cuckoo_filter::ScalableCuckooFilter<
         (u64, [Marker; 2]),
-        FxHasher,
+        FxHasher64,
         R,
     >,
     km: &u64,

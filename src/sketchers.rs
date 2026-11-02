@@ -42,7 +42,7 @@ use std::fmt;
 
 use fxhash::{FxHashMap, FxHashSet};
 #[cfg(feature = "approx-dedup")]
-use fxhash::FxHasher;
+use fxhash::FxHasher64;
 #[cfg(feature = "approx-dedup")]
 use rand::{rngs::SmallRng, SeedableRng};
 #[cfg(feature = "approx-dedup")]
@@ -192,7 +192,13 @@ pub struct PairedReadSketcher {
     kmer_counts: FxHashMap<Kmer, u32>,
     kmer_to_pair_set: FxHashSet<(u64, [Marker; 2])>,
     #[cfg(feature = "approx-dedup")]
-    approx_set: ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher, SmallRng>,
+    // `FxHasher64`, not the pointer-width `FxHasher`: on 32-bit targets
+    // (wasm32) the latter returns a 32-bit hash, whose top bits -- which
+    // `scalable_cuckoo_filter` uses as the fingerprint (`hash >> (64 - bits)`)
+    // -- are always zero. Every fingerprint then collides and the filter
+    // degenerates (inserts never match, the table keeps growing). On 64-bit
+    // targets both hashers are the same type.
+    approx_set: ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher64, SmallRng>,
     num_dup_removed: usize,
     total_read_length: u64,
     num_read_pairs: u64,
@@ -239,7 +245,7 @@ impl PairedReadSketcher {
             ScalableCuckooFilterBuilder::new()
                 .initial_capacity(1_000_000_0)
                 .false_positive_probability(fpr)
-                .hasher(FxHasher::default())
+                .hasher(FxHasher64::default())
                 .rng(SmallRng::seed_from_u64(DEFAULT_RNG_SEED))
                 .finish()
         };

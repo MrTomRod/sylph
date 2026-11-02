@@ -3,6 +3,7 @@ pub mod parallel_sketch;
 pub mod constants;
 pub mod types;
 pub mod seeding;
+pub mod kernels;
 pub mod cmdline;
 pub mod contain;
 pub mod twostage_db;

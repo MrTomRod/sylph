@@ -1,9 +1,7 @@
 use crate::cmdline::*;
 use rand::{rngs::SmallRng, SeedableRng};
-use scalable_cuckoo_filter::ScalableCuckooFilter;
 use scalable_cuckoo_filter::ScalableCuckooFilterBuilder;
 
-use fxhash::FxHashMap;
 use fxhash::FxHashSet;
 use fxhash::FxHasher;
 use memory_stats::memory_stats;
@@ -12,7 +10,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::constants::*;
-use crate::seeding::*;
 use crate::types::*;
 use log::*;
 use needletail::parse_fastx_file;
@@ -23,7 +20,14 @@ use std::io::BufWriter;
 use std::io::{prelude::*, BufReader};
 use std::path::Path;
 use std::sync::Mutex;
-pub type Marker = u32;
+
+// The pure kernels live in the dependency-light `crate::kernels` module;
+// re-export them here so that `sylph::sketch::{extract_markers, pair_kmer,
+// dup_removal_lsh_full, ...}` keeps working for existing users.
+pub use crate::kernels::{
+    dup_removal_lsh_full, dup_removal_lsh_full_exact, pair_kmer, pair_kmer_single, Marker,
+};
+pub use crate::seeding::{extract_markers, extract_markers_positions};
 
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
     if let Some(usage) = memory_stats() {
@@ -48,48 +52,6 @@ pub fn check_vram_and_block(max_ram: usize, file: &str) {
                 break;
             }
         }
-    }
-}
-
-pub fn extract_markers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
-    #[cfg(any(target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            use crate::avx2_seeding::*;
-            unsafe {
-                extract_markers_avx2(string, kmer_vec, c, k);
-            }
-        } else {
-            fmh_seeds(string, kmer_vec, c, k);
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        fmh_seeds(string, kmer_vec, c, k);
-    }
-}
-
-pub fn extract_markers_positions(
-    string: &[u8],
-    kmer_vec: &mut Vec<(usize, usize, u64)>,
-    c: usize,
-    k: usize,
-    contig_number: usize,
-) {
-    #[cfg(any(target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            use crate::avx2_seeding::*;
-            unsafe {
-                extract_markers_avx2_positions(string, kmer_vec, c, k, contig_number);
-            }
-        } else {
-            fmh_seeds_positions(string, kmer_vec, c, k, contig_number);
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        fmh_seeds_positions(string, kmer_vec, c, k, contig_number);
     }
 }
 
@@ -659,153 +621,6 @@ pub fn sketch_genome(
         }
         return Some(return_genome_sketch);
     }
-}
-
-#[inline]
-pub fn pair_kmer_single(s1: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
-    let k = std::mem::size_of::<Marker>() * 4;
-    if s1.len() < 4 * k + 2 {
-        return None;
-    } else {
-        let mut kmer_f = 0;
-        let mut kmer_g = 0;
-        let mut kmer_r = 0;
-        let mut kmer_t = 0;
-        let halfway = s1.len() / 2;
-        // len(s1)/2 + (k-1)* 2 + 2 < len(s1)
-        for i in 0..k {
-            let nuc_1 = BYTE_TO_SEQ[s1[2 * i] as usize] as Marker;
-            let nuc_2 = BYTE_TO_SEQ[s1[2 * i + halfway] as usize] as Marker;
-            let nuc_3 = BYTE_TO_SEQ[s1[1 + 2 * i] as usize] as Marker;
-            let nuc_4 = BYTE_TO_SEQ[s1[1 + 2 * i + halfway] as usize] as Marker;
-
-            kmer_f <<= 2;
-            kmer_f |= nuc_1;
-
-            kmer_r <<= 2;
-            kmer_r |= nuc_2;
-
-            kmer_g <<= 2;
-            kmer_g |= nuc_3;
-
-            kmer_t <<= 2;
-            kmer_t |= nuc_4;
-        }
-        return Some(([kmer_f, kmer_r], [kmer_g, kmer_t]));
-    }
-}
-
-#[inline]
-pub fn pair_kmer(s1: &[u8], s2: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
-    let k = std::mem::size_of::<Marker>() * 4;
-    if s1.len() < 2 * k + 1 || s2.len() < 2 * k + 1 {
-        return None;
-    } else {
-        let mut kmer_f = 0;
-        let mut kmer_g = 0;
-        let mut kmer_r = 0;
-        let mut kmer_t = 0;
-        for i in 0..k {
-            let nuc_1 = BYTE_TO_SEQ[s1[2 * i] as usize] as Marker;
-            let nuc_2 = BYTE_TO_SEQ[s2[2 * i] as usize] as Marker;
-            let nuc_3 = BYTE_TO_SEQ[s1[1 + 2 * i] as usize] as Marker;
-            let nuc_4 = BYTE_TO_SEQ[s2[1 + 2 * i] as usize] as Marker;
-
-            kmer_f <<= 2;
-            kmer_f |= nuc_1;
-
-            kmer_r <<= 2;
-            kmer_r |= nuc_2;
-
-            kmer_g <<= 2;
-            kmer_g |= nuc_3;
-
-            kmer_t <<= 2;
-            kmer_t |= nuc_4;
-        }
-        return Some(([kmer_f, kmer_r], [kmer_g, kmer_t]));
-    }
-}
-
-pub fn dup_removal_lsh_full_exact(
-    kmer_counts: &mut FxHashMap<Kmer, u32>,
-    kmer_to_pair_set: &mut FxHashSet<(u64, [Marker; 2])>,
-    //kmer_to_pair_set: &mut ScalableCuckooFilter<(u64,[Marker;2]), FxHasher>,
-    //kmer_to_pair_set: &mut GrowableBloom,
-    km: &u64,
-    kmer_pair: Option<([Marker; 2], [Marker; 2])>,
-    num_dup_removed: &mut usize,
-    no_dedup: bool,
-    threshold: Option<u32>,
-) {
-    let c = kmer_counts.entry(*km).or_insert(0);
-    let mut c_threshold = u32::MAX;
-    if let Some(t) = threshold {
-        c_threshold = t;
-    }
-    if !no_dedup && *c < c_threshold {
-        if let Some(doublepairs) = kmer_pair {
-            let mut ret = false;
-            if kmer_to_pair_set.contains(&(*km, doublepairs.0)) {
-                //Need this when using approximate data structures
-                if *c > 0 {
-                    ret = true;
-                }
-            } else {
-                kmer_to_pair_set.insert((*km, doublepairs.0));
-            }
-            if kmer_to_pair_set.contains(&(*km, doublepairs.1)) {
-                if *c > 0 {
-                    ret = true;
-                }
-            } else {
-                kmer_to_pair_set.insert((*km, doublepairs.1));
-            }
-            if ret {
-                *num_dup_removed += 1;
-                return;
-            }
-        }
-    }
-    *c += 1;
-}
-
-pub fn dup_removal_lsh_full<R: rand::Rng>(
-    kmer_counts: &mut FxHashMap<Kmer, u32>,
-    //kmer_to_pair_set: &mut FxHashSet<(u64,[Marker;2])>,
-    kmer_to_pair_set: &mut ScalableCuckooFilter<(u64, [Marker; 2]), FxHasher, R>,
-    //kmer_to_pair_set: &mut GrowableBloom,
-    km: &u64,
-    kmer_pair: Option<([Marker; 2], [Marker; 2])>,
-    num_dup_removed: &mut usize,
-    no_dedup: bool,
-) {
-    let c = kmer_counts.entry(*km).or_insert(0);
-    if !no_dedup {
-        if let Some(doublepairs) = kmer_pair {
-            let mut ret = false;
-            if kmer_to_pair_set.contains(&(*km, doublepairs.0)) {
-                //Need this when using approximate data structures
-                if *c > 0 {
-                    ret = true;
-                }
-            } else {
-                kmer_to_pair_set.insert(&(*km, doublepairs.0));
-            }
-            if kmer_to_pair_set.contains(&(*km, doublepairs.1)) {
-                if *c > 0 {
-                    ret = true;
-                }
-            } else {
-                kmer_to_pair_set.insert(&(*km, doublepairs.1));
-            }
-            if ret {
-                *num_dup_removed += 1;
-                return;
-            }
-        }
-    }
-    *c += 1;
 }
 
 pub fn sketch_pair_sequences(

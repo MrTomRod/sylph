@@ -113,7 +113,7 @@ fn get_chunks(indices: &Vec<usize>, steps: usize) -> Vec<Vec<usize>>{
     return_chunks
 }
 
-pub fn minimum_ani_fraction(args: &ContainArgs) -> f64 {
+pub(crate) fn minimum_ani_fraction(args: &ContainArgs) -> f64 {
     if let Some(minimum_ani) = args.minimum_ani {
         minimum_ani / 100.0
     } else if args.pseudotax {
@@ -477,17 +477,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             let is_sketch = j >= read_files.len() - read_sketch_files.len();
             let sequence_sketch = get_seq_sketch(&args, &read_files[j], is_sketch, effective_genome_c, db_k, threads_per_file);
             if sequence_sketch.is_some(){
-                let first_read_file = read_files[j][0];
                 let sequence_sketch = sequence_sketch.unwrap();
-
-                let kmer_id_opt;
-                if args.seq_id.is_some(){
-                    kmer_id_opt = Some((args.seq_id.unwrap()/100.).powf(sequence_sketch.k as f64));
-                }
-                else{
-                    kmer_id_opt = get_kmer_identity(&sequence_sketch, args.estimate_unknown);
-                    log::debug!("{} has estimated identity {:.3}.", &first_read_file, kmer_id_opt.unwrap().powf(1./sequence_sketch.k as f64) * 100.);
-                }
 
                 // Screen each two-stage database, then union its survivors with
                 // the (always fully-loaded, unscreened) plain genomes into one
@@ -499,63 +489,8 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                 let active_sketches: Vec<&GenomeSketch> =
                     dense_local.iter().chain(genome_sketches.iter()).collect();
 
-                let stats_vec_seq: Mutex<Vec<AniResult>> = Mutex::new(vec![]);
-                active_sketches.par_iter().for_each(|genome_sketch| {
-                    let res = get_stats(&args, genome_sketch, &sequence_sketch, None, args.log_reassignments);
-                    if let Some(res) = res {
-                        stats_vec_seq.lock().unwrap().push(res);
-                    }
-                });
+                let stats_vec_seq = profile_sample(&args, &active_sketches, &sequence_sketch);
 
-                let mut stats_vec_seq = stats_vec_seq.into_inner().unwrap();
-                estimate_true_cov(&mut stats_vec_seq, kmer_id_opt, args.estimate_unknown, sequence_sketch.mean_read_length, sequence_sketch.k);
-
-                if args.pseudotax{
-                    log::info!("{} taxonomic profiling; reassigning k-mers for {} genomes...", &first_read_file, stats_vec_seq.len());
-                    let winner_map = winner_table(&stats_vec_seq, args.log_reassignments);
-                    let remaining_genomes = stats_vec_seq.iter().map(|x| x.genome_sketch).collect::<Vec<&GenomeSketch>>();
-                    let stats_vec_seq_2 = Mutex::new(vec![]);
-                    remaining_genomes.into_par_iter().for_each(|genome_sketch|{
-                        let res = get_stats(&args, &genome_sketch, &sequence_sketch, Some(&winner_map), args.log_reassignments);
-                        if res.is_some() {
-                            stats_vec_seq_2.lock().unwrap().push(res.unwrap());
-                        }
-                    });
-                    stats_vec_seq = derep_if_reassign_threshold(&stats_vec_seq, stats_vec_seq_2.into_inner().unwrap(), args.redundant_ani, sequence_sketch.k);
-                    //stats_vec_seq = stats_vec_seq_2.into_inner().unwrap();
-                    estimate_true_cov(&mut stats_vec_seq, kmer_id_opt, args.estimate_unknown, sequence_sketch.mean_read_length, sequence_sketch.k);
-                    log::info!("{} has {} genomes passing profiling threshold. ", &first_read_file, stats_vec_seq.len());
-
-                    let mut bases_explained = 1.;
-                    if args.estimate_unknown{
-                        bases_explained = estimate_covered_bases(&stats_vec_seq, &sequence_sketch, sequence_sketch.mean_read_length, sequence_sketch.k);
-                        log::info!("{} has {:.2}% of reads detected in database by profile", &first_read_file, bases_explained * 100.);
-                        
-                    }
-
-                    let total_cov = stats_vec_seq.iter().map(|x| x.final_est_cov).sum::<f64>();
-                    let total_seq_cov = stats_vec_seq.iter().map(|x| x.final_est_cov * x.genome_sketch.gn_size as f64).sum::<f64>();
-                    for thing in stats_vec_seq.iter_mut(){
-                        thing.rel_abund = Some(thing.final_est_cov/total_cov * 100.);
-                    }
-                    for thing in stats_vec_seq.iter_mut(){
-                        if args.estimate_read_counts{
-                            thing.seq_abund = Some((thing.final_est_cov * thing.genome_sketch.gn_size as f64 / sequence_sketch.mean_read_length * bases_explained).round());
-                        }
-                        else{
-                            let seq_abund = thing.final_est_cov * thing.genome_sketch.gn_size as f64 / total_seq_cov * 100. * bases_explained;
-                            thing.seq_abund = Some(seq_abund);
-                        }
-                    }
-                }
-
-                if args.pseudotax{
-                    stats_vec_seq.sort_by(|x,y| y.rel_abund.unwrap().partial_cmp(&x.rel_abund.unwrap()).unwrap());
-                }
-                else{
-                    stats_vec_seq.sort_by(|x,y| y.final_est_ani.partial_cmp(&x.final_est_ani).unwrap());
-                }
-                
                 let mut out_writer = out_writer.lock().unwrap();
                 for res in stats_vec_seq{
                     print_ani_result(&res, args.pseudotax, &mut *out_writer);
@@ -573,7 +508,72 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     log::info!("sylph finished.");
 }
 
-pub fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Vec<AniResult<'a>>, ani_thresh: f64, k: usize) -> Vec<AniResult<'a>>{
+/// Profile (`args.pseudotax`) or query one sample against the genome sketches
+/// already screened for it (see `compute_dense_survivors`). In profiling mode
+/// this includes the pseudotax k-mer reassignment pass and relative/sequence
+/// abundances; in query mode it is a plain ANI estimate. Results are sorted by
+/// relative abundance (profiling) or ANI (query).
+pub fn profile_sample<'a>(args: &ContainArgs, genome_sketches: &[&'a GenomeSketch], sequence_sketch: &SequencesSketch) -> Vec<AniResult<'a>>{
+    let first_read_file = &sequence_sketch.file_name;
+
+    let kmer_id_opt;
+    if args.seq_id.is_some(){
+        kmer_id_opt = Some((args.seq_id.unwrap()/100.).powf(sequence_sketch.k as f64));
+    }
+    else{
+        kmer_id_opt = get_kmer_identity(sequence_sketch, args.estimate_unknown);
+        log::debug!("{} has estimated identity {:.3}.", first_read_file, kmer_id_opt.unwrap().powf(1./sequence_sketch.k as f64) * 100.);
+    }
+
+    let mut stats_vec_seq: Vec<AniResult> = genome_sketches.par_iter()
+        .filter_map(|genome_sketch| get_stats(args, genome_sketch, sequence_sketch, None, args.log_reassignments))
+        .collect();
+    estimate_true_cov(&mut stats_vec_seq, kmer_id_opt, args.estimate_unknown, sequence_sketch.mean_read_length, sequence_sketch.k);
+
+    if args.pseudotax{
+        log::info!("{} taxonomic profiling; reassigning k-mers for {} genomes...", first_read_file, stats_vec_seq.len());
+        let winner_map = winner_table(&stats_vec_seq, args.log_reassignments);
+        let remaining_genomes = stats_vec_seq.iter().map(|x| x.genome_sketch).collect::<Vec<&GenomeSketch>>();
+        let stats_vec_seq_2: Vec<AniResult> = remaining_genomes.into_par_iter()
+            .filter_map(|genome_sketch| get_stats(args, genome_sketch, sequence_sketch, Some(&winner_map), args.log_reassignments))
+            .collect();
+        stats_vec_seq = derep_if_reassign_threshold(&stats_vec_seq, stats_vec_seq_2, args.redundant_ani, sequence_sketch.k);
+        estimate_true_cov(&mut stats_vec_seq, kmer_id_opt, args.estimate_unknown, sequence_sketch.mean_read_length, sequence_sketch.k);
+        log::info!("{} has {} genomes passing profiling threshold. ", first_read_file, stats_vec_seq.len());
+
+        let mut bases_explained = 1.;
+        if args.estimate_unknown{
+            bases_explained = estimate_covered_bases(&stats_vec_seq, sequence_sketch, sequence_sketch.mean_read_length, sequence_sketch.k);
+            log::info!("{} has {:.2}% of reads detected in database by profile", first_read_file, bases_explained * 100.);
+        }
+
+        let total_cov = stats_vec_seq.iter().map(|x| x.final_est_cov).sum::<f64>();
+        let total_seq_cov = stats_vec_seq.iter().map(|x| x.final_est_cov * x.genome_sketch.gn_size as f64).sum::<f64>();
+        for thing in stats_vec_seq.iter_mut(){
+            thing.rel_abund = Some(thing.final_est_cov/total_cov * 100.);
+        }
+        for thing in stats_vec_seq.iter_mut(){
+            if args.estimate_read_counts{
+                thing.seq_abund = Some((thing.final_est_cov * thing.genome_sketch.gn_size as f64 / sequence_sketch.mean_read_length * bases_explained).round());
+            }
+            else{
+                let seq_abund = thing.final_est_cov * thing.genome_sketch.gn_size as f64 / total_seq_cov * 100. * bases_explained;
+                thing.seq_abund = Some(seq_abund);
+            }
+        }
+    }
+
+    if args.pseudotax{
+        stats_vec_seq.sort_by(|x,y| y.rel_abund.unwrap().partial_cmp(&x.rel_abund.unwrap()).unwrap());
+    }
+    else{
+        stats_vec_seq.sort_by(|x,y| y.final_est_ani.partial_cmp(&x.final_est_ani).unwrap());
+    }
+
+    stats_vec_seq
+}
+
+fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new: Vec<AniResult<'a>>, ani_thresh: f64, k: usize) -> Vec<AniResult<'a>>{
     let ani_thresh = ani_thresh/100.;
 
     let mut gn_sketch_to_contain = FxHashMap::default();
@@ -597,7 +597,7 @@ pub fn derep_if_reassign_threshold<'a>(results_old: &Vec<AniResult>, results_new
     return return_vec;
 }
 
-pub fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>, 
+fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>, 
                      estimate_unknown: bool, read_length: f64, k: usize){
     let mut multiplier = 1.;
     if estimate_unknown{
@@ -611,7 +611,7 @@ pub fn estimate_true_cov(results: &mut Vec<AniResult>, kmer_id_opt: Option<f64>,
     }
 }
 
-pub fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesSketch, read_length: f64, k: usize) -> f64{
+fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &SequencesSketch, read_length: f64, k: usize) -> f64{
     let multiplier = read_length / (read_length - (k as f64) + 1.);
 
     let mut num_covered_bases = 0.;
@@ -630,7 +630,7 @@ pub fn estimate_covered_bases(results: &Vec<AniResult>, sequence_sketch: &Sequen
     return f64::min(num_covered_bases as f64 / num_tentative_bases, 1.);
 }
 
-pub fn winner_table<'a>(results : &'a Vec<AniResult>, log_reassign: bool) -> FxHashMap<Kmer, (f64,&'a GenomeSketch, bool)> {
+fn winner_table<'a>(results : &'a Vec<AniResult>, log_reassign: bool) -> FxHashMap<Kmer, (f64,&'a GenomeSketch, bool)> {
     let mut kmer_to_genome_map : FxHashMap<_,_> = FxHashMap::default();
     for res in results.iter(){
         //let gn_sketch = &genome_sketches[res.genome_sketch_index];
@@ -839,7 +839,7 @@ fn get_seq_sketch(
     }
 }
 
-pub fn get_stats<'a>(
+fn get_stats<'a>(
     args: &ContainArgs,
     genome_sketch: &'a GenomeSketch,
     sequence_sketch: &SequencesSketch,
@@ -946,15 +946,15 @@ pub fn get_stats<'a>(
 }
 
 /// Scalar outputs of the coverage-correction + ANI estimation.
-pub struct Finalized {
-    pub naive_ani: f64,
-    pub final_est_ani: f64,
-    pub final_est_cov: f64,
-    pub median_cov: f64,
-    pub mean_cov: f64,
-    pub lambda: AdjustStatus,
-    pub ani_ci: (Option<f64>, Option<f64>),
-    pub lambda_ci: (Option<f64>, Option<f64>),
+struct Finalized {
+    naive_ani: f64,
+    final_est_ani: f64,
+    final_est_cov: f64,
+    median_cov: f64,
+    mean_cov: f64,
+    lambda: AdjustStatus,
+    ani_ci: (Option<f64>, Option<f64>),
+    lambda_ci: (Option<f64>, Option<f64>),
 }
 
 /// Coverage-correction + ANI math shared by `get_stats` (materialized genome)
@@ -962,7 +962,7 @@ pub struct Finalized {
 /// Consumes the matched coverage counts `covs` and the genome k-mer count
 /// `n_kmers`; applies the minimum-ANI gate (returns None below it). When
 /// `reassign_log` is set, logs a drop during pseudotax reassignment.
-pub fn finalize_stats(
+fn finalize_stats(
     args: &ContainArgs,
     k: usize,
     n_kmers: usize,
@@ -1081,7 +1081,7 @@ pub fn finalize_stats(
 }
 
 
-pub fn ani_from_lambda(lambda: Option<f64>, _mean: f64, k: f64, full_cov: &[u32]) -> Option<f64> {
+fn ani_from_lambda(lambda: Option<f64>, _mean: f64, k: f64, full_cov: &[u32]) -> Option<f64> {
     if lambda.is_none() {
         return None;
     }
@@ -1113,7 +1113,7 @@ pub fn ani_from_lambda(lambda: Option<f64>, _mean: f64, k: f64, full_cov: &[u32]
     return ret_ani;
 }
 
-pub fn bootstrap_interval(
+fn bootstrap_interval(
     covs_full: &Vec<u32>,
     k: f64,
     args: &ContainArgs,
@@ -1167,7 +1167,7 @@ pub fn bootstrap_interval(
 }
 
 
-pub fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Option<f64>{
+fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Option<f64>{
 
     if !estimate_unknown{
         return None
